@@ -1,0 +1,102 @@
+最高20位(位12—位31)包含物理地址空间页的页码，也就是物理地址的高20位。低12位包含页的属性。下图所示的属性中内容为0的位是Intel公司为80486等处理器所保留的位，在为80386编程使用到它们时必须设置为0。在位9至位11的AVL字段供软件使用。表项的最低位是存在属性位，记作P。P位表示该表项是否有效。P=1表项有效；P=0表项无效
+
+首先把线性地址的最高10位(即位22至位31)作为页目录表的索引，对应表项所包含的页码指定页表；然后，再把线性地址的中间10位(即位12至位21)作为所指定的页目录表中的页表项的索引，对应表项所包含的页码指定物理地址空间中的一页；最后，把所指定的物理页的页码作为高20位，把线性地址的低12位不加改变地作为32位物理地址的低12位。 
+
+#define MAP_NR(addr) (((addr)-LOW_MEM)>>12)	// 指定内存地址映射为页号。物理地址减去低端内存位置，再除以4KB，得页面号。
+
+//// 根据指定的线性地址和限长（页表个数），释放对应内存页表所指定的内存块并置表项空闲。
+// 页目录位于物理地址0 开始处，共1024 项，每项4字节，占4K 字节。每个目录项指定一个页表。
+// 内核页表从物理地址0x1000 处开始（紧接着目录空间），共4个页表。每个页表有1024 项，每项占 4 字节。
+// 也占4K 内存。每个页表项对应一页物理内存（4K）。因此一个页表最多可映射 4MB 物理内存。
+// 参数：from - 起始基地址；size - 释放的长度。
+
+unsigned long put_page(unsigned long page,unsigned long address)//物理地址，逻辑地址
+{
+	unsigned long tmp, *page_table;
+
+	/* NOTE !!! This uses the fact that _pg_dir=0 */
+	/* 注意!!!这里使用了页目录基址_pg_dir=0 的条件 */
+	
+	// 如果申请的页面位置低于LOW_MEM(1Mb)或超出系统实际含有内存高端HIGH_MEMORY，则发出警告。
+	if (page < LOW_MEM || page >= HIGH_MEMORY)
+		printk("Trying to put page %p at %p\n",page,address);
+	// 如果申请的页面在内存页面映射字节图中没有置位，则显示警告信息。
+	if (mem_map[(page-LOW_MEM)>>12] < 1)
+		printk("mem_map disagrees with %p at %p\n",page,address);
+	// 计算指定地址在页目录表中对应的目录项指针。
+	page_table = (unsigned long *) ((address>>20) & 0xffc);
+	// 如果该目录项有效(P=1)(也即指定的页表在内存中)，则从中取得指定页表的地址 page_table。
+	if ((*page_table)&1)
+		page_table = (unsigned long *) (0xfffff000 & *page_table);
+	else {
+	// 否则，申请空闲页面给页表使用，并在对应目录项中置相应标志7（User, U/S, R/W）。然后将
+	// 该页表的地址page_table。
+		if (!(tmp=get_free_page()))
+			return 0;
+		*page_table = tmp|7;
+		page_table = (unsigned long *) tmp;
+	}
+	// 在页表中设置指定地址的物理内存页面的页表项内容。每个页表共可有1024 项(0x3ff)。
+	page_table[(address>>12) & 0x3ff] = page | 7;
+	/* no need for invalidate */
+	/* 不需要刷新页变换高速缓冲 */
+	return page;			// 返回页面地址。
+}
+int free_page_tables(unsigned long from,unsigned long size)
+{
+	unsigned long *pg_table;
+	unsigned long * dir, nr;
+	
+	// 首先检测参数 from 给出的线性基地址是否在 4MB的边界处。因为该函数只能处理这种情况。
+	if (from & 0x3fffff)
+		panic("free_page_tables called with wrong alignment");
+	// 若 from =0，则出错。说明试图释放内核和缓冲所占用的空间.
+	if (!from)
+		panic("Trying to free up swapper memory space");
+	size = (size + 0x3fffff) >> 22;
+	// 下面一句计算起始目录项。对应的目录项号=from>>22，因每项占4 字节，并且由于页目录是从
+	// 物理地址0 开始，因此实际的目录项指针=目录项号<<2，也即(from>>20)。与上0xffc 确保
+	// 目录项指针范围有效。
+	dir = (unsigned long *) ((from>>20) & 0xffc); /* _pg_dir = 0 */
+	for ( ; size-->0 ; dir++) {
+		// size 现在是需要被释放内存的目录项数。
+		if (!(1 & *dir))	// 如果该目录项无效(P 位=0)，则继续。
+			continue;		// 目录项的位0(P 位)表示对应页表是否存在。
+		pg_table = (unsigned long *) (0xfffff000 & *dir);	// 取目录项中页表地址。
+		for (nr=0 ; nr<1024 ; nr++) {
+			// 每个页表有1024 个页项。
+			if (1 & *pg_table)		// 若该页表项有效(P 位=1)，则释放对应内存页。
+				free_page(0xfffff000 & *pg_table);
+			*pg_table = 0;			// 该页表项内容清零。
+			pg_table++;				// 指向页表中下一项。
+		}
+		free_page(0xfffff000 & *dir);	// 释放该页表所占内存页面。但由于页表在
+										// 物理地址1M 以内，所以这句什么都不做。
+		*dir = 0;					// 对相应页表的目录项清零。
+	}
+	invalidate();					// 刷新页变换高速缓冲。
+	return 0;
+}
+
+void free_page(unsigned long addr)
+{
+	unsigned long page_num;
+	
+	if (addr < LOW_MEM) return;		// 如果物理地址addr 小于内存低端（1MB），则返回。
+	if (addr >= HIGH_MEMORY)		// 如果物理地址addr>=内存最高端，则显示出错信息。
+		panic("trying to free nonexistent page");
+	
+	page_num = MAP_NR(addr);		// 从物理地址计算得到页面号。
+	
+	if (mem_map[page_num] > 0)		// 如果对应内存页面映射字节大于0，说明没有出现错误，可以返回。
+	{
+		mem_map[page_num]--;		// 对应内存页面映射字节(页面号引用计数)减 1。
+		return;	
+	}
+	else
+	{
+		mem_map[page_num]=0;		// 否则置对应页面映射字节为0，并显示出错信息，死机。
+		panic("trying to free free page");
+	}
+}
+
